@@ -100,87 +100,95 @@ def save_history():
 # ── Build stock universe ──────────────────────────────
 def build_universe():
     """
-    Fetch all NYSE+NASDAQ stocks with market cap > 1B.
-    Then fetch 200-day history to compute EMA20, EMA50, SMA200.
-    Also grab 52-week high and previous close.
+    Fetch NYSE+NASDAQ stocks with market cap > 1B in bulk.
+    Uses Polygon's ticker list API with market_cap filter to avoid
+    per-ticker API calls. Then fetches 200-day history in parallel.
     """
     log("Building stock universe (NYSE+NASDAQ, mktcap>1B)...")
 
-    symbols = []
+    # Step 1: Get all tickers WITH market cap > 1B in one paginated call
+    # Polygon v3 tickers supports market_cap filter directly
+    qualified = {}  # sym -> {market_cap, name, sic_description}
+
     for exchange in ["XNYS", "XNAS"]:
         url = (f"https://api.polygon.io/v3/reference/tickers"
                f"?market=stocks&exchange={exchange}&active=true"
                f"&limit=1000&apiKey={POLYGON_KEY}")
+        page = 0
         while url:
             try:
                 r = req.get(url, timeout=30)
                 data = r.json()
                 for t in data.get("results", []):
-                    symbols.append(t["ticker"])
+                    sym    = t.get("ticker")
+                    mktcap = t.get("market_cap") or 0
+                    if sym and mktcap >= MIN_MARKET_CAP:
+                        qualified[sym] = {
+                            "market_cap": mktcap,
+                            "name":       t.get("name", sym),
+                            "industry":   t.get("sic_description", "Other"),
+                        }
                 nxt = data.get("next_url", "")
                 url = (nxt + f"&apiKey={POLYGON_KEY}") if nxt else None
-                time.sleep(0.05)
+                page += 1
+                time.sleep(0.12)
             except Exception as e:
-                log(f"  Ticker fetch error: {e}")
+                log(f"  Ticker page error: {e}")
                 break
 
-    log(f"  Found {len(symbols)} total symbols, fetching details...")
+    log(f"  Found {len(qualified)} stocks with mktcap>$1B, fetching history...")
 
+    # Step 2: Fetch 200-day history for each qualified stock
     today     = date.today().strftime("%Y-%m-%d")
     from_date = (date.today() - timedelta(days=300)).strftime("%Y-%m-%d")
     added = 0
 
-    for sym in symbols:
+    for sym, info in qualified.items():
         try:
-            # Get market cap from ticker details
-            r = req.get(f"https://api.polygon.io/v3/reference/tickers/{sym}"
-                        f"?apiKey={POLYGON_KEY}", timeout=15)
-            detail = r.json().get("results", {})
-            mktcap = detail.get("market_cap", 0) or 0
-            if mktcap < MIN_MARKET_CAP:
-                time.sleep(0.02)
-                continue
-
-            # Get 200-day history
-            r2 = req.get(f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day"
-                         f"/{from_date}/{today}?adjusted=true&sort=asc&limit=300"
-                         f"&apiKey={POLYGON_KEY}", timeout=15)
-            bars = r2.json().get("results", [])
+            r = req.get(
+                f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day"
+                f"/{from_date}/{today}?adjusted=true&sort=asc&limit=300"
+                f"&apiKey={POLYGON_KEY}", timeout=15)
+            bars = r.json().get("results", [])
             if len(bars) < 20:
-                time.sleep(0.02)
+                time.sleep(0.05)
                 continue
 
             closes = [b["c"] for b in bars]
             highs  = [b["h"] for b in bars]
+            dates  = [datetime.utcfromtimestamp(b["t"]/1000).strftime("%Y-%m-%d") for b in bars]
 
             ema20  = calc_ema(closes, 20)
             ema50  = calc_ema(closes, 50)  if len(closes) >= 50  else None
             sma200 = calc_sma(closes, 200) if len(closes) >= 200 else None
             hi52   = max(highs[-252:]) if len(highs) >= 252 else max(highs)
 
+            # Store historical prices for Theme tab period returns
+            hist_prices = dict(zip(dates, closes))
+
             with lock:
                 state["universe"][sym] = {
-                    "market_cap":  mktcap,
-                    "prev_close":  closes[-1],
+                    "market_cap":  info["market_cap"],
+                    "name":        info["name"],
+                    "industry":    info["industry"],
+                    "prev_close":  closes[-2] if len(closes) >= 2 else closes[-1],
                     "ema20":       ema20,
                     "ema50":       ema50,
                     "sma200":      sma200,
                     "hi52":        hi52,
                     "close":       closes[-1],
+                    "hist_prices": hist_prices,
                 }
             added += 1
             time.sleep(0.05)
 
-        except Exception as e:
+        except Exception:
             time.sleep(0.05)
 
-    log(f"  Universe built: {added} stocks with mktcap>1B")
+    log(f"  Universe built: {added} stocks")
 
     # Backfill 14 trading days of history
     backfill_history(days=14)
-
-    # Enrich with industry labels + historical prices for Theme tab
-    enrich_universe_history()
 
     state["initialized"] = True
 
